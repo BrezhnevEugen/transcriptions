@@ -24,6 +24,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>VoiceTray needs microphone access to transcribe your speech into text.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>VoiceTray uses speech recognition to show live words while you are dictating.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Eugen Brezhnev</string>
 </dict>

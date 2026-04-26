@@ -3,6 +3,7 @@ import AVFAudio
 import AVFoundation
 import Carbon
 import Security
+import Speech
 import SwiftUI
 
 @main
@@ -22,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let debugLogStore = DebugLogStore()
     private lazy var menuBarController = MenuBarController(appDelegate: self)
     private lazy var recorder = AudioRecorder()
+    private lazy var liveSpeechMonitor = LiveSpeechMonitor()
     private lazy var insertionService = TextInsertionService()
     private lazy var hotkeyManager = HotkeyManager { [weak self] in
         Task { await self?.toggleRecording() }
@@ -137,6 +139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             debugLogStore.log("Start recording requested")
             currentStatus = .listening
             try await ensureMicrophonePermission()
+            startLiveSpeechMonitor()
             try recorder.start(maxDuration: settingsStore.settings.maxRecordingDurationSeconds) { [weak self] in
                 self?.debugLogStore.log("Max recording duration reached")
                 Task { await self?.stopAndProcessRecording() }
@@ -155,6 +158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard recorder.isRecording else { return }
         autoStopTask?.cancel()
         autoStopTask = nil
+        liveSpeechMonitor.stop()
+        debugLogStore.log("Live words monitor stopped")
 
         do {
             currentStatus = .transcribing
@@ -351,6 +356,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     quietSince = nil
                 }
             }
+        }
+    }
+
+    private func startLiveSpeechMonitor() {
+        liveSpeechMonitor.start(locale: Locale.current) { [weak self] event in
+            self?.debugLogStore.log(event)
         }
     }
 }
@@ -759,6 +770,97 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
         guard let recorder, recorder.isRecording else { return -160 }
         recorder.updateMeters()
         return recorder.averagePower(forChannel: 0)
+    }
+}
+
+final class LiveSpeechMonitor {
+    private var recognizer: SFSpeechRecognizer?
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let engine = AVAudioEngine()
+    private var lastPartial = ""
+
+    func start(locale: Locale, log: @escaping (String) -> Void) {
+        stop()
+        lastPartial = ""
+        log("Live words monitor starting")
+
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            guard let self else { return }
+            guard status == .authorized else {
+                log("Live words unavailable: Speech permission \(Self.authorizationDescription(status))")
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.startRecognition(locale: locale, log: log)
+            }
+        }
+    }
+
+    func stop() {
+        if engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        request?.endAudio()
+        task?.cancel()
+        task = nil
+        request = nil
+        recognizer = nil
+    }
+
+    private func startRecognition(locale: Locale, log: @escaping (String) -> Void) {
+        recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(locale: Locale(identifier: "ru_RU"))
+        guard let recognizer, recognizer.isAvailable else {
+            log("Live words unavailable: recognizer is not available for \(locale.identifier)")
+            return
+        }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        self.request = request
+
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            request.append(buffer)
+        }
+
+        engine.prepare()
+        do {
+            try engine.start()
+            log("Live words monitor active: \(recognizer.locale.identifier)")
+        } catch {
+            input.removeTap(onBus: 0)
+            log("Live words failed to start: \(error.localizedDescription)")
+            return
+        }
+
+        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if let result {
+                let text = result.bestTranscription.formattedString
+                guard !text.isEmpty, text != self.lastPartial else { return }
+                self.lastPartial = text
+                log("Live words: \(text)")
+            }
+            if let error {
+                log("Live words error: \(error.localizedDescription)")
+                self.stop()
+            }
+        }
+    }
+
+    private static func authorizationDescription(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
+        switch status {
+        case .notDetermined: return "not determined"
+        case .denied: return "denied"
+        case .restricted: return "restricted"
+        case .authorized: return "authorized"
+        @unknown default: return "unknown"
+        }
     }
 }
 
