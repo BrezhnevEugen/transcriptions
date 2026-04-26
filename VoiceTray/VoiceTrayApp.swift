@@ -149,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             debugLogStore.log("Start recording requested")
             currentStatus = .listening
             try await ensureMicrophonePermission()
-            startLiveSpeechMonitor()
+            try startLiveSpeechMonitor()
             try recorder.start(maxDuration: settingsStore.settings.maxRecordingDurationSeconds) { [weak self] in
                 self?.debugLogStore.log("Max recording duration reached")
                 Task { await self?.stopAndProcessRecording() }
@@ -411,9 +411,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startLiveSpeechMonitor() {
+    private func startLiveSpeechMonitor() throws {
         let locale = liveSpeechLocale()
-        liveSpeechMonitor.start(locale: locale) { [weak self] event in
+        let apiKey = try keychainStore.read(key: "openai_api_key")
+        liveSpeechMonitor.start(apiKey: apiKey, locale: locale) { [weak self] event in
             self?.debugLogStore.log(event)
         } onPartialText: { [weak self] partialText in
             self?.handleLivePartialText(partialText)
@@ -879,96 +880,220 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
 }
 
 final class LiveSpeechMonitor {
-    private var recognizer: SFSpeechRecognizer?
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
     private let engine = AVAudioEngine()
-    private var lastPartial = ""
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var receiveTask: Task<Void, Never>?
+    private var isRunning = false
+    private var realtimePartialText = ""
 
-    func start(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
+    func start(apiKey: String, locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
         stop()
-        lastPartial = ""
-        log("Live words monitor starting")
+        isRunning = true
+        realtimePartialText = ""
+        log("OpenAI Realtime live transcription starting")
 
-        SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            guard let self else { return }
-            guard status == .authorized else {
-                log("Live words unavailable: Speech permission \(Self.authorizationDescription(status))")
-                return
-            }
+        var request = URLRequest(url: URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!)
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
 
-            DispatchQueue.main.async {
-                self.startRecognition(locale: locale, log: log, onPartialText: onPartialText)
-            }
+        let webSocketTask = URLSession(configuration: .default).webSocketTask(with: request)
+        self.webSocketTask = webSocketTask
+        webSocketTask.resume()
+
+        receiveTask = Task { [weak self] in
+            await self?.receiveLoop(log: log, onPartialText: onPartialText)
         }
+
+        sendTranscriptionSessionUpdate(locale: locale, log: log)
+        startAudioStream(log: log)
     }
 
     func stop() {
+        isRunning = false
         if engine.isRunning {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
-        request?.endAudio()
-        task?.cancel()
-        task = nil
-        request = nil
-        recognizer = nil
+        sendJSON(["type": "input_audio_buffer.commit"])
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        receiveTask?.cancel()
+        receiveTask = nil
+        webSocketTask = nil
     }
 
-    private func startRecognition(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
-        recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(locale: Locale(identifier: "ru_RU"))
-        guard let recognizer, recognizer.isAvailable else {
-            log("Live words unavailable: recognizer is not available for \(locale.identifier)")
+    private func startAudioStream(log: @escaping (String) -> Void) {
+        let input = engine.inputNode
+        let inputFormat = input.inputFormat(forBus: 0)
+        guard let outputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 24_000,
+            channels: 1,
+            interleaved: false
+        ),
+        let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            log("OpenAI Realtime failed: unable to create 24kHz mono converter")
             return
         }
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.taskHint = .dictation
-        request.addsPunctuation = false
-        self.request = request
-
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            request.append(buffer)
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
+            guard let self, self.isRunning else { return }
+            guard let converted = self.convert(buffer: buffer, converter: converter, outputFormat: outputFormat),
+                  let pcmData = self.pcm16Data(from: converted),
+                  !pcmData.isEmpty else {
+                return
+            }
+            self.sendJSON([
+                "type": "input_audio_buffer.append",
+                "audio": pcmData.base64EncodedString()
+            ])
         }
 
         engine.prepare()
         do {
             try engine.start()
-            log("Live words monitor active: \(recognizer.locale.identifier)")
+            log("OpenAI Realtime audio stream active: 24kHz PCM16 mono")
         } catch {
             input.removeTap(onBus: 0)
-            log("Live words failed to start: \(error.localizedDescription)")
-            return
+            log("OpenAI Realtime audio stream failed: \(error.localizedDescription)")
         }
+    }
 
-        task = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-            if let result {
-                let text = result.bestTranscription.formattedString
-                guard !text.isEmpty, text != self.lastPartial else { return }
-                self.lastPartial = text
-                log("Live words: \(text)")
-                onPartialText(text)
-            }
-            if let error {
-                log("Live words error: \(error.localizedDescription)")
-                self.stop()
+    private func receiveLoop(log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) async {
+        while !Task.isCancelled {
+            do {
+                guard let message = try await webSocketTask?.receive() else { return }
+                switch message {
+                case .string(let text):
+                    handleServerEvent(text, log: log, onPartialText: onPartialText)
+                case .data(let data):
+                    if let text = String(data: data, encoding: .utf8) {
+                        handleServerEvent(text, log: log, onPartialText: onPartialText)
+                    }
+                @unknown default:
+                    break
+                }
+            } catch {
+                if isRunning {
+                    log("OpenAI Realtime receive error: \(error.localizedDescription)")
+                }
+                return
             }
         }
     }
 
-    private static func authorizationDescription(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
-        switch status {
-        case .notDetermined: return "not determined"
-        case .denied: return "denied"
-        case .restricted: return "restricted"
-        case .authorized: return "authorized"
-        @unknown default: return "unknown"
+    private func handleServerEvent(_ text: String, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
+        guard let data = text.data(using: .utf8),
+              let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = event["type"] as? String else {
+            return
         }
+
+        switch type {
+        case "transcription_session.created", "transcription_session.updated":
+            log("OpenAI Realtime session: \(type)")
+        case "input_audio_buffer.speech_started":
+            log("OpenAI Realtime speech started")
+        case "input_audio_buffer.speech_stopped":
+            log("OpenAI Realtime speech stopped")
+        case "input_audio_buffer.committed":
+            log("OpenAI Realtime audio committed")
+        case "conversation.item.input_audio_transcription.delta":
+            if let delta = event["delta"] as? String, !delta.isEmpty {
+                realtimePartialText += delta
+                log("OpenAI delta: \(delta)")
+                onPartialText(realtimePartialText)
+            }
+        case "conversation.item.input_audio_transcription.completed":
+            if let transcript = event["transcript"] as? String, !transcript.isEmpty {
+                realtimePartialText = transcript
+                log("OpenAI realtime completed: \(transcript)")
+            }
+        case "error":
+            let error = event["error"] as? [String: Any]
+            log("OpenAI Realtime error: \((error?["message"] as? String) ?? text)")
+        default:
+            break
+        }
+    }
+
+    private func sendTranscriptionSessionUpdate(locale: Locale, log: @escaping (String) -> Void) {
+        let language = openAILanguageCode(for: locale)
+        let event: [String: Any] = [
+            "type": "transcription_session.update",
+            "session": [
+                "input_audio_format": "pcm16",
+                "input_audio_transcription": [
+                    "model": "gpt-4o-transcribe",
+                    "prompt": "Dictation for a software developer. Preserve technical terms, commands, URLs, filenames, code identifiers, and punctuation.",
+                    "language": language
+                ],
+                "turn_detection": [
+                    "type": "server_vad",
+                    "threshold": 0.45,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 450
+                ],
+                "input_audio_noise_reduction": [
+                    "type": "near_field"
+                ]
+            ]
+        ]
+        sendJSON(event)
+        log("OpenAI Realtime session update sent: language=\(language)")
+    }
+
+    private func sendJSON(_ object: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+              let text = String(data: data, encoding: .utf8) else {
+            return
+        }
+        webSocketTask?.send(.string(text)) { _ in }
+    }
+
+    private func convert(buffer: AVAudioPCMBuffer, converter: AVAudioConverter, outputFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let ratio = outputFormat.sampleRate / buffer.format.sampleRate
+        let outputFrameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputFrameCapacity) else { return nil }
+
+        var didProvideInput = false
+        var error: NSError?
+        converter.convert(to: outputBuffer, error: &error) { _, status in
+            if didProvideInput {
+                status.pointee = .noDataNow
+                return nil
+            }
+            didProvideInput = true
+            status.pointee = .haveData
+            return buffer
+        }
+
+        if error != nil || outputBuffer.frameLength == 0 {
+            return nil
+        }
+        return outputBuffer
+    }
+
+    private func pcm16Data(from buffer: AVAudioPCMBuffer) -> Data? {
+        guard let channel = buffer.floatChannelData?[0] else { return nil }
+        let frameCount = Int(buffer.frameLength)
+        var data = Data(capacity: frameCount * 2)
+        for index in 0..<frameCount {
+            let sample = max(-1, min(1, channel[index]))
+            let value = Int16(sample < 0 ? sample * 32768 : sample * 32767)
+            var littleEndian = value.littleEndian
+            data.append(Data(bytes: &littleEndian, count: MemoryLayout<Int16>.size))
+        }
+        return data
+    }
+
+    private func openAILanguageCode(for locale: Locale) -> String {
+        if #available(macOS 13.0, *) {
+            if let languageCode = locale.language.languageCode?.identifier {
+                return languageCode
+            }
+        }
+        return locale.identifier.prefix(2).lowercased()
     }
 }
 
