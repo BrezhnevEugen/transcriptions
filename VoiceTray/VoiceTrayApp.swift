@@ -1,4 +1,5 @@
 import AppKit
+import AVFAudio
 import AVFoundation
 import Carbon
 import Security
@@ -35,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBarController.install()
         hotkeyManager.registerDefaultHotkey()
         checkInitialPermissions()
+        requestMicrophonePermissionOnFirstLaunch()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -78,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func requestMicrophonePermissionFromMenu() {
         Task {
             do {
+                try recorder.triggerMicrophonePermissionProbe()
                 try await ensureMicrophonePermission()
             } catch {
                 showError(error.localizedDescription)
@@ -155,6 +158,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func ensureMicrophonePermission() async throws {
+        if #available(macOS 14.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                return
+            case .undetermined:
+                let granted = await withCheckedContinuation { continuation in
+                    AVAudioApplication.requestRecordPermission { granted in
+                        continuation.resume(returning: granted)
+                    }
+                }
+                if !granted { throw VoiceTrayError.microphoneDenied }
+                return
+            case .denied:
+                throw VoiceTrayError.microphoneDenied
+            @unknown default:
+                throw VoiceTrayError.microphoneDenied
+            }
+        }
+
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             return
@@ -169,6 +191,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func checkInitialPermissions() {
         if !AXIsProcessTrusted() {
             menuBarController.setPermissionWarning()
+        }
+    }
+
+    private func requestMicrophonePermissionOnFirstLaunch() {
+        Task {
+            let needsPrompt: Bool
+            if #available(macOS 14.0, *) {
+                needsPrompt = AVAudioApplication.shared.recordPermission == .undetermined
+            } else {
+                needsPrompt = AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined
+            }
+            guard needsPrompt else { return }
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            try? recorder.triggerMicrophonePermissionProbe()
+            try? await ensureMicrophonePermission()
         }
     }
 
@@ -433,6 +470,7 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
     private var recorder: AVAudioRecorder?
     private var maxDurationTimer: Timer?
     private var timeoutHandler: (() -> Void)?
+    private var permissionEngine: AVAudioEngine?
 
     var isRecording: Bool {
         recorder?.isRecording == true
@@ -455,6 +493,20 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
         maxDurationTimer?.invalidate()
         maxDurationTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(maxDuration), repeats: false) { [weak self] _ in
             self?.timeoutHandler?()
+        }
+    }
+
+    func triggerMicrophonePermissionProbe() throws {
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        input.installTap(onBus: 0, bufferSize: 128, format: format) { _, _ in }
+        try engine.start()
+        permissionEngine = engine
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak input] in
+            input?.removeTap(onBus: 0)
+            self?.permissionEngine?.stop()
+            self?.permissionEngine = nil
         }
     }
 
