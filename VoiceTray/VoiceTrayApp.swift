@@ -172,8 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard recorder.isRecording else { return }
         autoStopTask?.cancel()
         autoStopTask = nil
-        try? await Task.sleep(nanoseconds: 650_000_000)
-        liveSpeechMonitor.stop()
+        await liveSpeechMonitor.finish()
         debugLogStore.log("Live words monitor stopped")
         flushLatestLivePartialBeforeProcessing()
 
@@ -983,6 +982,7 @@ final class LiveSpeechMonitor {
     private var lastPartial = ""
     private var committedText = ""
     private var isMonitoring = false
+    private var finishContinuation: CheckedContinuation<Void, Never>?
 
     func start(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
         stop()
@@ -1007,6 +1007,41 @@ final class LiveSpeechMonitor {
     func stop() {
         isMonitoring = false
         stopCurrentRecognition()
+        committedText = ""
+        lastPartial = ""
+    }
+
+    func finish() async {
+        guard isMonitoring else { return }
+        isMonitoring = false
+
+        if engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        request?.endAudio()
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { [weak self] in
+                await withCheckedContinuation { continuation in
+                    Task { @MainActor in
+                        self?.finishContinuation = continuation
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+            await group.next()
+            group.cancelAll()
+        }
+
+        finishContinuation?.resume()
+        finishContinuation = nil
+        task?.cancel()
+        task = nil
+        request = nil
+        recognizer = nil
         committedText = ""
         lastPartial = ""
     }
@@ -1057,11 +1092,15 @@ final class LiveSpeechMonitor {
                 }
                 if result.isFinal {
                     self.committedText = text
+                    self.finishContinuation?.resume()
+                    self.finishContinuation = nil
                     self.restartRecognition(locale: locale, log: log, onPartialText: onPartialText)
                 }
             }
             if let error {
                 log("Instant live words segment ended: \(error.localizedDescription)")
+                self.finishContinuation?.resume()
+                self.finishContinuation = nil
                 self.restartRecognition(locale: locale, log: log, onPartialText: onPartialText)
             }
         }
