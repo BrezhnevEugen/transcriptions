@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        ProcessInfo.processInfo.disableAutomaticTermination("VoiceTray must stay available in the menu bar.")
         debugLogStore.log("App launched")
         menuBarController.install()
         hotkeyManager.registerDefaultHotkey()
@@ -334,6 +335,17 @@ enum AppStatus: String {
         case .error: return "exclamationmark.triangle"
         }
     }
+
+    var menuTitle: String {
+        switch self {
+        case .idle: return "VoiceTray"
+        case .listening: return "REC"
+        case .transcribing: return "STT"
+        case .translating: return "TR"
+        case .inserting: return "INS"
+        case .error: return "ERR"
+        }
+    }
 }
 
 struct DebugLogEntry: Identifiable, Equatable {
@@ -480,6 +492,7 @@ final class MenuBarController {
             self.statusMenuItem.title = status.rawValue
             self.recordMenuItem.title = status == .listening ? "Stop Recording" : "Start Recording"
             self.statusItem.button?.image = NSImage(systemSymbolName: status.symbolName, accessibilityDescription: status.rawValue)
+            self.statusItem.button?.title = " \(status.menuTitle)"
         }
     }
 
