@@ -19,6 +19,7 @@ struct VoiceTrayApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settingsStore = SettingsStore()
     private let keychainStore = KeychainStore(service: "VoiceTray")
+    private let debugLogStore = DebugLogStore()
     private lazy var menuBarController = MenuBarController(appDelegate: self)
     private lazy var recorder = AudioRecorder()
     private lazy var insertionService = TextInsertionService()
@@ -27,12 +28,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private var recordingTask: Task<Void, Never>?
     private var settingsWindow: NSWindow?
+    private var debugWindow: NSWindow?
     private var currentStatus: AppStatus = .idle {
         didSet { menuBarController.update(status: currentStatus) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        debugLogStore.log("App launched")
         menuBarController.install()
         hotkeyManager.registerDefaultHotkey()
         checkInitialPermissions()
@@ -77,12 +80,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
+    func openDebugConsole() {
+        let view = DebugConsoleView(debugLogStore: debugLogStore)
+        let hostingController = NSHostingController(rootView: view)
+
+        if debugWindow == nil {
+            let window = NSWindow(contentViewController: hostingController)
+            window.title = "VoiceTray Debug Console"
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.setContentSize(NSSize(width: 760, height: 520))
+            window.center()
+            debugWindow = window
+        } else {
+            debugWindow?.contentViewController = hostingController
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        debugWindow?.makeKeyAndOrderFront(nil)
+    }
+
     func requestMicrophonePermissionFromMenu() {
         Task {
             do {
+                debugLogStore.log("Manual microphone permission request started")
                 try recorder.triggerMicrophonePermissionProbe()
                 try await ensureMicrophonePermission()
+                debugLogStore.log("Microphone permission is available")
             } catch {
+                debugLogStore.log("Microphone permission error: \(error.localizedDescription)")
                 showError(error.localizedDescription)
             }
         }
@@ -94,12 +119,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startRecording() async {
         do {
+            debugLogStore.log("Start recording requested")
             currentStatus = .listening
             try await ensureMicrophonePermission()
             try recorder.start(maxDuration: settingsStore.settings.maxRecordingDurationSeconds) { [weak self] in
                 Task { await self?.stopAndProcessRecording() }
             }
+            debugLogStore.log("Recording started")
         } catch {
+            debugLogStore.log("Recording start error: \(error.localizedDescription)")
             showError(error.localizedDescription)
             currentStatus = .error
             resetStatusSoon()
@@ -112,27 +140,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             currentStatus = .transcribing
             let audioURL = try recorder.stop()
+            let audioSize = (try? FileManager.default.attributesOfItem(atPath: audioURL.path)[.size] as? NSNumber)?.intValue ?? 0
+            debugLogStore.log("Recording stopped: \(audioURL.lastPathComponent), \(audioSize) bytes")
             defer { try? FileManager.default.removeItem(at: audioURL) }
 
             let settings = settingsStore.settings
             let platform = settings.aiPlatform
+            debugLogStore.log("Selected AI platform: \(platform.title)")
             guard platform == .directAPI else {
                 throw VoiceTrayError.platformUnavailable(platform.rawValue)
             }
 
             let apiKey = try keychainStore.read(key: "openai_api_key")
+            debugLogStore.log("API key loaded from Keychain")
             let transcriber = OpenAITranscriptionService(apiKey: apiKey, settings: settings)
+            debugLogStore.log("Sending audio to STT model: \(settings.transcriptionModel)")
             let transcription = try await transcriber.transcribe(audioFileURL: audioURL)
+            debugLogStore.log("Transcription received, language: \(transcription.detectedLanguage ?? "unknown")")
+            debugLogStore.log("Transcribed text: \(transcription.text)")
 
             var finalText = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if settings.targetLanguage != .auto {
                 currentStatus = .translating
+                debugLogStore.log("Translation requested: \(settings.targetLanguage.displayName), model: \(settings.translationModel)")
                 let translator = OpenAITranslationService(apiKey: apiKey, settings: settings)
                 finalText = try await translator.translate(
                     text: finalText,
                     sourceLanguage: transcription.detectedLanguage,
                     targetLanguage: settings.targetLanguage.displayName
                 ).trimmingCharacters(in: .whitespacesAndNewlines)
+                debugLogStore.log("Translated text: \(finalText)")
             }
 
             guard !finalText.isEmpty else {
@@ -140,17 +177,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             if settings.enablePreviewBeforeInsert {
+                debugLogStore.log("Preview shown before insertion")
                 finalText = await PreviewWindow.show(text: finalText) ?? ""
                 guard !finalText.isEmpty else {
+                    debugLogStore.log("Insertion cancelled from preview/copy")
                     currentStatus = .idle
                     return
                 }
+                debugLogStore.log("Preview accepted")
             }
 
             currentStatus = .inserting
+            debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
             try await insertionService.insertText(finalText, restoreClipboard: settings.restoreClipboardAfterInsert)
+            debugLogStore.log("Insertion completed. Restore clipboard: \(settings.restoreClipboardAfterInsert)")
             currentStatus = .idle
         } catch {
+            debugLogStore.log("Pipeline error: \(error.localizedDescription)")
             showError(error.localizedDescription)
             currentStatus = .error
             resetStatusSoon()
@@ -190,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func checkInitialPermissions() {
         if !AXIsProcessTrusted() {
+            debugLogStore.log("Accessibility permission missing")
             menuBarController.setPermissionWarning()
         }
     }
@@ -204,8 +248,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             guard needsPrompt else { return }
             try? await Task.sleep(nanoseconds: 800_000_000)
+            debugLogStore.log("Auto microphone permission probe started")
             try? recorder.triggerMicrophonePermissionProbe()
             try? await ensureMicrophonePermission()
+            debugLogStore.log("Auto microphone permission probe finished")
         }
     }
 
@@ -247,6 +293,94 @@ enum AppStatus: String {
     }
 }
 
+struct DebugLogEntry: Identifiable, Equatable {
+    let id = UUID()
+    let timestamp: Date
+    let message: String
+}
+
+final class DebugLogStore: ObservableObject {
+    @Published private(set) var entries: [DebugLogEntry] = []
+    private let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
+    func log(_ message: String) {
+        DispatchQueue.main.async {
+            let entry = DebugLogEntry(timestamp: Date(), message: message)
+            self.entries.append(entry)
+            if self.entries.count > 500 {
+                self.entries.removeFirst(self.entries.count - 500)
+            }
+        }
+    }
+
+    func clear() {
+        entries.removeAll()
+    }
+
+    func exportText() -> String {
+        entries
+            .map { "[\(formatter.string(from: $0.timestamp))] \($0.message)" }
+            .joined(separator: "\n")
+    }
+
+    func timestamp(_ date: Date) -> String {
+        formatter.string(from: date)
+    }
+}
+
+struct DebugConsoleView: View {
+    @ObservedObject var debugLogStore: DebugLogStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("VoiceTray Debug Console")
+                    .font(.headline)
+                Spacer()
+                Button("Copy Log") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(debugLogStore.exportText(), forType: .string)
+                }
+                Button("Clear") {
+                    debugLogStore.clear()
+                }
+            }
+
+            Text("Shows recording → STT → translation → preview → insertion events. No API key is logged.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(debugLogStore.entries) { entry in
+                            Text("[\(debugLogStore.timestamp(entry.timestamp))] \(entry.message)")
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(entry.id)
+                        }
+                    }
+                    .padding(10)
+                }
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onChange(of: debugLogStore.entries) { entries in
+                    if let last = entries.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 700, minHeight: 460)
+    }
+}
+
 final class MenuBarController {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private weak var appDelegate: AppDelegate?
@@ -273,6 +407,10 @@ final class MenuBarController {
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
+
+        let debugConsole = NSMenuItem(title: "Debug Console…", action: #selector(openDebugConsole), keyEquivalent: "d")
+        debugConsole.target = self
+        menu.addItem(debugConsole)
 
         let accessibility = NSMenuItem(title: "Open Accessibility Settings", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         accessibility.target = self
@@ -312,6 +450,10 @@ final class MenuBarController {
 
     @objc private func openSettings() {
         appDelegate?.openSettings()
+    }
+
+    @objc private func openDebugConsole() {
+        appDelegate?.openDebugConsole()
     }
 
     @objc private func openAccessibilitySettings() {
