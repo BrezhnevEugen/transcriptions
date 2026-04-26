@@ -75,6 +75,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
+    func requestMicrophonePermissionFromMenu() {
+        Task {
+            do {
+                try await ensureMicrophonePermission()
+            } catch {
+                showError(error.localizedDescription)
+            }
+        }
+    }
+
     func quit() {
         NSApp.terminate(nil)
     }
@@ -231,6 +241,14 @@ final class MenuBarController {
         accessibility.target = self
         menu.addItem(accessibility)
 
+        let microphoneRequest = NSMenuItem(title: "Request Microphone Access", action: #selector(requestMicrophoneAccess), keyEquivalent: "")
+        microphoneRequest.target = self
+        menu.addItem(microphoneRequest)
+
+        let microphoneSettings = NSMenuItem(title: "Open Microphone Settings", action: #selector(openMicrophoneSettings), keyEquivalent: "")
+        microphoneSettings.target = self
+        menu.addItem(microphoneSettings)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -261,6 +279,14 @@ final class MenuBarController {
 
     @objc private func openAccessibilitySettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+
+    @objc private func requestMicrophoneAccess() {
+        appDelegate?.requestMicrophonePermissionFromMenu()
+    }
+
+    @objc private func openMicrophoneSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
     }
 
     @objc private func quit() {
