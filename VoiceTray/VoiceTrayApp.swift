@@ -34,7 +34,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var targetApplicationBundleIdentifier: String?
     private var lastTargetApplicationBundleIdentifier: String?
     private var liveInsertedText = ""
-    private var liveStableText = ""
     private var liveLatestPartialText = ""
     private var liveInsertedOutputText = ""
     private var liveInsertedAnyText = false
@@ -144,7 +143,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             targetApplicationBundleIdentifier = resolveTargetApplicationBundleIdentifier()
             liveInsertedText = ""
-            liveStableText = ""
             liveLatestPartialText = ""
             liveInsertedOutputText = ""
             liveInsertedAnyText = false
@@ -461,21 +459,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !normalizedPartial.isEmpty else { return }
         liveLatestPartialText = normalizedPartial
 
-        let stableText = stableLiveText(from: normalizedPartial)
-        guard !stableText.isEmpty else { return }
-
-        let delta = liveInsertionDelta(from: liveInsertedText, to: stableText)
-        guard !delta.isEmpty else { return }
-
-        liveStableText = stableText
-        liveInsertedText = stableText
-        liveInsertedOutputText += delta
-        liveInsertedAnyText = true
-        debugLogStore.log("Live insert: \(delta)")
-
         let previousTask = liveInsertTask
         liveInsertTask = Task {
             await previousTask?.value
+            await self.applyLivePartial(normalizedPartial)
+        }
+    }
+
+    @MainActor
+    private func applyLivePartial(_ partialText: String) async {
+        guard partialText != liveInsertedText else { return }
+        let oldText = liveInsertedText
+        let oldOutputText = liveInsertedOutputText
+
+        if let delta = liveAppendDelta(from: oldText, to: partialText) {
+            liveInsertedText = partialText
+            liveInsertedOutputText += delta
+            liveInsertedAnyText = true
+            debugLogStore.log("Live append: \(delta)")
             do {
                 try await insertionService.insertText(
                     delta,
@@ -483,62 +484,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
                 )
             } catch {
-                debugLogStore.log("Live insert error: \(error.localizedDescription)")
+                debugLogStore.log("Live append error: \(error.localizedDescription)")
             }
+            return
+        }
+
+        let replacementText = liveOutputText(for: partialText)
+        guard !oldOutputText.isEmpty, replacementText != oldOutputText else { return }
+        debugLogStore.log("Live correction replace: \(replacementText)")
+        do {
+            try await insertionService.replaceLastInsertedText(
+                replacementText,
+                replacingDraft: oldOutputText,
+                targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+            )
+            liveInsertedText = partialText
+            liveInsertedOutputText = replacementText
+            liveInsertedAnyText = true
+        } catch {
+            debugLogStore.log("Live correction ignored: \(error.localizedDescription)")
         }
     }
 
     private func flushLatestLivePartialBeforeProcessing() {
         let normalizedPartial = liveLatestPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedPartial.isEmpty, normalizedPartial.count > liveInsertedText.count else { return }
-
-        let delta = liveInsertionDelta(from: liveInsertedText, to: normalizedPartial)
-        guard !delta.isEmpty else { return }
-
-        liveStableText = normalizedPartial
-        liveInsertedText = normalizedPartial
-        liveInsertedOutputText += delta
-        liveInsertedAnyText = true
-        debugLogStore.log("Live flush on stop: \(delta)")
+        guard !normalizedPartial.isEmpty else { return }
 
         let previousTask = liveInsertTask
         liveInsertTask = Task {
             await previousTask?.value
-            do {
-                try await insertionService.insertText(
-                    delta,
-                    restoreClipboard: false,
-                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
-                )
-            } catch {
-                debugLogStore.log("Live flush error: \(error.localizedDescription)")
-            }
+            await self.applyLivePartial(normalizedPartial)
         }
     }
 
-    private func stableLiveText(from text: String) -> String {
-        let words = text
-            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
-            .map(String.init)
-        guard words.count >= 2 else { return "" }
-
-        let stableWords = words.dropLast()
-        let stableText = stableWords.joined(separator: " ")
-        guard stableText.count >= liveStableText.count else { return liveStableText }
-        return stableText
-    }
-
-    private func liveInsertionDelta(from oldText: String, to newText: String) -> String {
+    private func liveAppendDelta(from oldText: String, to newText: String) -> String? {
         guard !newText.isEmpty else { return "" }
-        guard !oldText.isEmpty else { return newText + " " }
-        guard newText.hasPrefix(oldText) else {
-            debugLogStore.log("Live correction ignored: \(newText)")
-            return ""
-        }
+        guard !oldText.isEmpty else { return liveOutputText(for: newText) }
+        guard newText.hasPrefix(oldText) else { return nil }
 
         let suffix = String(newText.dropFirst(oldText.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !suffix.isEmpty else { return "" }
         return suffix + " "
+    }
+
+    private func liveOutputText(for text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines) + " "
     }
 }
 
