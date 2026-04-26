@@ -91,14 +91,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let window = NSWindow(contentViewController: hostingController)
             window.title = "VoiceTray Debug Console"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.level = .floating
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            window.isReleasedWhenClosed = false
             window.setContentSize(NSSize(width: 760, height: 520))
             window.center()
             debugWindow = window
         } else {
             debugWindow?.contentViewController = hostingController
+            debugWindow?.level = .floating
+            debugWindow?.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         }
 
         NSApp.activate(ignoringOtherApps: true)
+        debugWindow?.orderFrontRegardless()
         debugWindow?.makeKeyAndOrderFront(nil)
     }
 
