@@ -36,8 +36,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var liveInsertedText = ""
     private var liveStableText = ""
     private var liveLatestPartialText = ""
-    private var liveTailCandidate = ""
-    private var liveTailConfirmationCount = 0
     private var liveInsertedOutputText = ""
     private var liveInsertedAnyText = false
     private var liveInsertTask: Task<Void, Never>?
@@ -148,8 +146,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             liveInsertedText = ""
             liveStableText = ""
             liveLatestPartialText = ""
-            liveTailCandidate = ""
-            liveTailConfirmationCount = 0
             liveInsertedOutputText = ""
             liveInsertedAnyText = false
             liveInsertTask = nil
@@ -524,24 +520,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let words = text
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .map(String.init)
-        guard !words.isEmpty else { return "" }
-
-        let tail = words.last ?? ""
-        if tail == liveTailCandidate {
-            liveTailConfirmationCount += 1
-        } else {
-            liveTailCandidate = tail
-            liveTailConfirmationCount = 1
-        }
-
-        if words.count == 1 {
-            return liveTailConfirmationCount >= 2 ? text : ""
-        }
+        guard words.count >= 2 else { return "" }
 
         let stableWords = words.dropLast()
-        let stableTextWithoutTail = stableWords.joined(separator: " ")
-        let shouldIncludeTail = liveTailConfirmationCount >= 2
-        let stableText = shouldIncludeTail ? text : stableTextWithoutTail
+        let stableText = stableWords.joined(separator: " ")
         guard stableText.count >= liveStableText.count else { return liveStableText }
         return stableText
     }
