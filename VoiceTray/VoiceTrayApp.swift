@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingTask: Task<Void, Never>?
     private var settingsWindow: NSWindow?
     private var debugWindow: NSWindow?
+    private var targetApplicationBundleIdentifier: String?
     private var currentStatus: AppStatus = .idle {
         didSet { menuBarController.update(status: currentStatus) }
     }
@@ -37,7 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         ProcessInfo.processInfo.disableAutomaticTermination("VoiceTray must stay available in the menu bar.")
+        settingsStore.settings.enablePreviewBeforeInsert = false
+        settingsStore.save()
         debugLogStore.log("App launched")
+        debugLogStore.log("Insert mode: instant insert")
         menuBarController.install()
         hotkeyManager.registerDefaultHotkey()
         checkInitialPermissions()
@@ -128,6 +132,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startRecording() async {
         do {
+            targetApplicationBundleIdentifier = resolveTargetApplicationBundleIdentifier()
+            debugLogStore.log("Target app: \(targetApplicationBundleIdentifier ?? "unknown")")
             debugLogStore.log("Start recording requested")
             currentStatus = .listening
             try await ensureMicrophonePermission()
@@ -202,7 +208,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             currentStatus = .inserting
             debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
-            try await insertionService.insertText(finalText, restoreClipboard: settings.restoreClipboardAfterInsert)
+            try await insertionService.insertText(
+                finalText,
+                restoreClipboard: settings.restoreClipboardAfterInsert,
+                targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+            )
             debugLogStore.log("Insertion completed. Restore clipboard: \(settings.restoreClipboardAfterInsert)")
             currentStatus = .idle
         } catch {
@@ -283,6 +293,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             currentStatus = .idle
         }
+    }
+
+    private func resolveTargetApplicationBundleIdentifier() -> String? {
+        let ignoredBundleIdentifiers: Set<String> = [
+            Bundle.main.bundleIdentifier ?? "",
+            "com.apple.controlcenter",
+            "com.apple.systemuiserver",
+            "com.apple.finder"
+        ]
+
+        if let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           !ignoredBundleIdentifiers.contains(frontmost) {
+            return frontmost
+        }
+
+        return NSWorkspace.shared.runningApplications
+            .first { app in
+                app.activationPolicy == .regular &&
+                app.isActive &&
+                !(app.bundleIdentifier.map { ignoredBundleIdentifiers.contains($0) } ?? false)
+            }?
+            .bundleIdentifier
     }
 
     private func startSilenceAutoStopMonitor() {
@@ -627,7 +659,7 @@ struct AppSettings: Codable, Equatable {
     var translationModel = "gpt-4.1-mini"
     var maxRecordingDurationSeconds = 60
     var restoreClipboardAfterInsert = true
-    var enablePreviewBeforeInsert = true
+    var enablePreviewBeforeInsert = false
 }
 
 enum AIPlatform: String, Codable, CaseIterable, Identifiable {
@@ -845,7 +877,7 @@ struct OpenAIContent: Decodable {
 }
 
 final class TextInsertionService {
-    func insertText(_ text: String, restoreClipboard: Bool) async throws {
+    func insertText(_ text: String, restoreClipboard: Bool, targetApplicationBundleIdentifier: String?) async throws {
         let pasteboard = NSPasteboard.general
         let oldString = pasteboard.string(forType: .string)
         pasteboard.clearContents()
@@ -853,6 +885,12 @@ final class TextInsertionService {
 
         guard AXIsProcessTrusted() else {
             throw VoiceTrayError.accessibilityDeniedCopied
+        }
+
+        if let targetApplicationBundleIdentifier,
+           let targetApplication = NSRunningApplication.runningApplications(withBundleIdentifier: targetApplicationBundleIdentifier).first {
+            targetApplication.activate(options: [.activateIgnoringOtherApps])
+            try await Task.sleep(nanoseconds: 250_000_000)
         }
 
         let source = CGEventSource(stateID: .combinedSessionState)
