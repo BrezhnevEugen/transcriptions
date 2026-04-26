@@ -306,7 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     if let quietSince, Date().timeIntervalSince(quietSince) > 1.8 {
                         debugLogStore.log("Silence detected. Auto-stopping recording")
-                        await stopAndProcessRecording()
+                        Task { await self.stopAndProcessRecording() }
                         return
                     }
                 } else {
