@@ -225,12 +225,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if liveInsertedAnyText {
                 debugLogStore.log("Post-processing: replacing live draft with final text")
                 await liveInsertTask?.value
-                try await insertionService.replaceLastInsertedText(
-                    finalText,
-                    replacingCharacterCount: liveInsertedOutputText.count,
-                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
-                )
-                debugLogStore.log("Post-processing completed: live draft replaced")
+                do {
+                    try await insertionService.replaceLastInsertedText(
+                        finalText,
+                        replacingDraft: liveInsertedOutputText,
+                        targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                    )
+                    debugLogStore.log("Post-processing completed: live draft replaced")
+                } catch VoiceTrayError.safeReplacementUnavailable {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(finalText, forType: .string)
+                    debugLogStore.log("Post-processing skipped: safe draft range not found. Final text copied to clipboard")
+                }
             } else {
                 debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
                 try await insertionService.insertText(
@@ -399,8 +405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if quietSince == nil {
                         quietSince = Date()
                     }
-                    if let quietSince, Date().timeIntervalSince(quietSince) > 1.8 {
-                        debugLogStore.log("Silence detected. Auto-stopping recording")
+                    if let quietSince, Date().timeIntervalSince(quietSince) > 12 {
+                        debugLogStore.log("Long silence detected. Auto-stopping recording")
                         Task { await self.stopAndProcessRecording() }
                         return
                     }
@@ -884,10 +890,14 @@ final class LiveSpeechMonitor {
     private var task: SFSpeechRecognitionTask?
     private let engine = AVAudioEngine()
     private var lastPartial = ""
+    private var committedText = ""
+    private var isMonitoring = false
 
     func start(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
         stop()
+        isMonitoring = true
         lastPartial = ""
+        committedText = ""
         log("Instant live words monitor starting")
 
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
@@ -904,18 +914,14 @@ final class LiveSpeechMonitor {
     }
 
     func stop() {
-        if engine.isRunning {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-        }
-        request?.endAudio()
-        task?.cancel()
-        task = nil
-        request = nil
-        recognizer = nil
+        isMonitoring = false
+        stopCurrentRecognition()
+        committedText = ""
+        lastPartial = ""
     }
 
     private func startRecognition(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
+        guard isMonitoring else { return }
         recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(locale: Locale(identifier: "ru_RU"))
         guard let recognizer, recognizer.isAvailable else {
             log("Instant live words unavailable: recognizer is not available for \(locale.identifier)")
@@ -927,6 +933,7 @@ final class LiveSpeechMonitor {
         request.taskHint = .dictation
         request.addsPunctuation = false
         self.request = request
+        lastPartial = ""
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -937,7 +944,9 @@ final class LiveSpeechMonitor {
 
         engine.prepare()
         do {
-            try engine.start()
+            if !engine.isRunning {
+                try engine.start()
+            }
             log("Instant live words active: \(recognizer.locale.identifier)")
         } catch {
             input.removeTap(onBus: 0)
@@ -948,17 +957,49 @@ final class LiveSpeechMonitor {
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
             if let result {
-                let text = result.bestTranscription.formattedString
-                guard !text.isEmpty, text != self.lastPartial else { return }
-                self.lastPartial = text
-                log("Instant live words: \(text)")
-                onPartialText(text)
+                let partial = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+                let text = self.combinedText(with: partial)
+                if !text.isEmpty, text != self.lastPartial {
+                    self.lastPartial = text
+                    log("Instant live words: \(text)")
+                    onPartialText(text)
+                }
+                if result.isFinal {
+                    self.committedText = text
+                    self.restartRecognition(locale: locale, log: log, onPartialText: onPartialText)
+                }
             }
             if let error {
-                log("Instant live words error: \(error.localizedDescription)")
-                self.stop()
+                log("Instant live words segment ended: \(error.localizedDescription)")
+                self.restartRecognition(locale: locale, log: log, onPartialText: onPartialText)
             }
         }
+    }
+
+    private func restartRecognition(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
+        guard isMonitoring else { return }
+        stopCurrentRecognition()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.startRecognition(locale: locale, log: log, onPartialText: onPartialText)
+        }
+    }
+
+    private func stopCurrentRecognition() {
+        if engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        request?.endAudio()
+        task?.cancel()
+        task = nil
+        request = nil
+        recognizer = nil
+    }
+
+    private func combinedText(with partial: String) -> String {
+        guard !committedText.isEmpty else { return partial }
+        guard !partial.isEmpty else { return committedText }
+        return committedText + " " + partial
     }
 
     private static func authorizationDescription(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
@@ -1087,6 +1128,26 @@ struct OpenAIContent: Decodable {
 
 final class TextInsertionService {
     func insertText(_ text: String, restoreClipboard: Bool, targetApplicationBundleIdentifier: String?) async throws {
+        try await pasteText(text, restoreClipboard: restoreClipboard, targetApplicationBundleIdentifier: targetApplicationBundleIdentifier)
+    }
+
+    func replaceLastInsertedText(_ text: String, replacingDraft draft: String, targetApplicationBundleIdentifier: String?) async throws {
+        guard AXIsProcessTrusted() else {
+            throw VoiceTrayError.accessibilityDeniedCopied
+        }
+
+        try await activateTargetApplication(bundleIdentifier: targetApplicationBundleIdentifier)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        guard selectDraftSuffixIfFocused(draft) else {
+            throw VoiceTrayError.safeReplacementUnavailable
+        }
+
+        try await Task.sleep(nanoseconds: 80_000_000)
+        try await pasteText(text, restoreClipboard: false, targetApplicationBundleIdentifier: nil)
+    }
+
+    private func pasteText(_ text: String, restoreClipboard: Bool, targetApplicationBundleIdentifier: String?) async throws {
         let pasteboard = NSPasteboard.general
         let oldString = pasteboard.string(forType: .string)
         pasteboard.clearContents()
@@ -1096,11 +1157,7 @@ final class TextInsertionService {
             throw VoiceTrayError.accessibilityDeniedCopied
         }
 
-        if let targetApplicationBundleIdentifier,
-           let targetApplication = NSRunningApplication.runningApplications(withBundleIdentifier: targetApplicationBundleIdentifier).first {
-            targetApplication.activate(options: [.activateIgnoringOtherApps])
-            try await Task.sleep(nanoseconds: 250_000_000)
-        }
+        try await activateTargetApplication(bundleIdentifier: targetApplicationBundleIdentifier)
 
         let source = CGEventSource(stateID: .combinedSessionState)
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
@@ -1119,18 +1176,6 @@ final class TextInsertionService {
         }
     }
 
-    func replaceLastInsertedText(_ text: String, replacingCharacterCount characterCount: Int, targetApplicationBundleIdentifier: String?) async throws {
-        guard AXIsProcessTrusted() else {
-            throw VoiceTrayError.accessibilityDeniedCopied
-        }
-
-        try await activateTargetApplication(bundleIdentifier: targetApplicationBundleIdentifier)
-        try await Task.sleep(nanoseconds: 150_000_000)
-        deletePreviousCharacters(characterCount)
-        try await Task.sleep(nanoseconds: 120_000_000)
-        try await insertText(text, restoreClipboard: false, targetApplicationBundleIdentifier: targetApplicationBundleIdentifier)
-    }
-
     private func activateTargetApplication(bundleIdentifier: String?) async throws {
         guard let bundleIdentifier,
               let targetApplication = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first else {
@@ -1140,19 +1185,62 @@ final class TextInsertionService {
         try await Task.sleep(nanoseconds: 250_000_000)
     }
 
-    private func deletePreviousCharacters(_ count: Int) {
-        guard count > 0 else { return }
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let cappedCount = min(count, 4_000)
-        for _ in 0..<cappedCount {
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x33, keyDown: true)
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x33, keyDown: false)
-            keyDown?.post(tap: .cghidEventTap)
-            keyUp?.post(tap: .cghidEventTap)
+    private func selectDraftSuffixIfFocused(_ draft: String) -> Bool {
+        let candidates = replacementCandidates(for: draft)
+        guard !candidates.isEmpty else { return false }
+
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedValue) == .success,
+              let focusedElement = focusedValue else {
+            return false
         }
+
+        let element = focusedElement as! AXUIElement
+        var valueRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &valueRef) == .success,
+              let currentValue = valueRef as? String else {
+            return false
+        }
+
+        var selectedRangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &selectedRangeRef) == .success,
+              let selectedRangeValue = selectedRangeRef,
+              CFGetTypeID(selectedRangeValue) == AXValueGetTypeID() else {
+            return false
+        }
+
+        var selectedRange = CFRange()
+        guard AXValueGetValue(selectedRangeValue as! AXValue, .cfRange, &selectedRange), selectedRange.length == 0 else {
+            return false
+        }
+
+        let nsValue = currentValue as NSString
+        for candidate in candidates {
+            let candidateLength = (candidate as NSString).length
+            guard selectedRange.location >= candidateLength else { continue }
+            let start = selectedRange.location - candidateLength
+            let previousText = nsValue.substring(with: NSRange(location: start, length: candidateLength))
+            guard previousText == candidate else { continue }
+
+            var replacementRange = CFRange(location: start, length: candidateLength)
+            guard let axRange = AXValueCreate(.cfRange, &replacementRange) else { return false }
+            return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange) == .success
+        }
+
+        return false
+    }
+
+    private func replacementCandidates(for draft: String) -> [String] {
+        let exact = draft
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        var candidates: [String] = []
+        for candidate in [exact, trimmed] where !candidate.isEmpty && !candidates.contains(candidate) {
+            candidates.append(candidate)
+        }
+        return candidates
     }
 }
-
 final class HotkeyManager {
     private var hotKeyRef: EventHotKeyRef?
     private let handler: () -> Void
@@ -1266,6 +1354,7 @@ enum VoiceTrayError: LocalizedError {
     case emptyTranscription
     case notRecording
     case platformUnavailable(String)
+    case safeReplacementUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -1285,6 +1374,8 @@ enum VoiceTrayError: LocalizedError {
             return "Recording is not active."
         case .platformUnavailable(let platform):
             return "\(platform) is available as a research option only. Use Direct API in the current MVP."
+        case .safeReplacementUnavailable:
+            return "Final text is ready, but VoiceTray could not safely select only the live draft. The draft was left untouched to avoid erasing existing chat text."
         }
     }
 }
