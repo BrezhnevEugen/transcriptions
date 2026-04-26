@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentStatus: AppStatus = .idle {
         didSet { menuBarController.update(status: currentStatus) }
     }
+    private var autoStopTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -48,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func toggleRecording() async {
         if recorder.isRecording {
+            debugLogStore.log("Stop recording requested")
             await stopAndProcessRecording()
         } else {
             await startRecording()
@@ -123,9 +125,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentStatus = .listening
             try await ensureMicrophonePermission()
             try recorder.start(maxDuration: settingsStore.settings.maxRecordingDurationSeconds) { [weak self] in
+                self?.debugLogStore.log("Max recording duration reached")
                 Task { await self?.stopAndProcessRecording() }
             }
             debugLogStore.log("Recording started")
+            startSilenceAutoStopMonitor()
         } catch {
             debugLogStore.log("Recording start error: \(error.localizedDescription)")
             showError(error.localizedDescription)
@@ -136,6 +140,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func stopAndProcessRecording() async {
         guard recorder.isRecording else { return }
+        autoStopTask?.cancel()
+        autoStopTask = nil
 
         do {
             currentStatus = .transcribing
@@ -269,6 +275,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             currentStatus = .idle
+        }
+    }
+
+    private func startSilenceAutoStopMonitor() {
+        autoStopTask?.cancel()
+        autoStopTask = Task { [weak self] in
+            guard let self else { return }
+            let startedAt = Date()
+            var quietSince: Date?
+            var lastTickSecond = 0
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard recorder.isRecording else { return }
+
+                let elapsed = Date().timeIntervalSince(startedAt)
+                let elapsedSecond = Int(elapsed)
+                if elapsedSecond > 0, elapsedSecond % 5 == 0, elapsedSecond != lastTickSecond {
+                    lastTickSecond = elapsedSecond
+                    debugLogStore.log("Recording active: \(elapsedSecond)s")
+                }
+
+                guard elapsed > 1.2 else { continue }
+                let level = recorder.currentAveragePower()
+                if level < -42 {
+                    if quietSince == nil {
+                        quietSince = Date()
+                    }
+                    if let quietSince, Date().timeIntervalSince(quietSince) > 1.8 {
+                        debugLogStore.log("Silence detected. Auto-stopping recording")
+                        await stopAndProcessRecording()
+                        return
+                    }
+                } else {
+                    quietSince = nil
+                }
+            }
         }
     }
 }
@@ -629,6 +672,7 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
         ]
         let recorder = try AVAudioRecorder(url: url, settings: settings)
         recorder.delegate = self
+        recorder.isMeteringEnabled = true
         recorder.prepareToRecord()
         recorder.record()
         self.recorder = recorder
@@ -658,6 +702,12 @@ final class AudioRecorder: NSObject, AVAudioRecorderDelegate {
         recorder.stop()
         self.recorder = nil
         return recorder.url
+    }
+
+    func currentAveragePower() -> Float {
+        guard let recorder, recorder.isRecording else { return -160 }
+        recorder.updateMeters()
+        return recorder.averagePower(forChannel: 0)
     }
 }
 
