@@ -172,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard recorder.isRecording else { return }
         autoStopTask?.cancel()
         autoStopTask = nil
+        try? await Task.sleep(nanoseconds: 650_000_000)
         liveSpeechMonitor.stop()
         debugLogStore.log("Live words monitor stopped")
         flushLatestLivePartialBeforeProcessing()
