@@ -32,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var debugWindow: NSWindow?
     private var targetApplicationBundleIdentifier: String?
+    private var lastTargetApplicationBundleIdentifier: String?
+    private var liveInsertedText = ""
+    private var liveInsertedAnyText = false
+    private var liveInsertTask: Task<Void, Never>?
     private var currentStatus: AppStatus = .idle {
         didSet { menuBarController.update(status: currentStatus) }
     }
@@ -46,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         debugLogStore.log("Insert mode: instant insert")
         menuBarController.install()
         hotkeyManager.registerDefaultHotkey()
+        installTargetApplicationTracker()
         checkInitialPermissions()
         requestMicrophonePermissionOnFirstLaunch()
     }
@@ -135,6 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startRecording() async {
         do {
             targetApplicationBundleIdentifier = resolveTargetApplicationBundleIdentifier()
+            liveInsertedText = ""
+            liveInsertedAnyText = false
+            liveInsertTask = nil
             debugLogStore.log("Target app: \(targetApplicationBundleIdentifier ?? "unknown")")
             debugLogStore.log("Start recording requested")
             currentStatus = .listening
@@ -212,13 +220,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             currentStatus = .inserting
-            debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
-            try await insertionService.insertText(
-                finalText,
-                restoreClipboard: settings.restoreClipboardAfterInsert,
-                targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
-            )
-            debugLogStore.log("Insertion completed. Restore clipboard: \(settings.restoreClipboardAfterInsert)")
+            if liveInsertedAnyText {
+                await liveInsertTask?.value
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(finalText, forType: .string)
+                debugLogStore.log("Final text copied to clipboard; live insert already wrote text into target app")
+            } else {
+                debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
+                try await insertionService.insertText(
+                    finalText,
+                    restoreClipboard: settings.restoreClipboardAfterInsert,
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                )
+                debugLogStore.log("Insertion completed. Restore clipboard: \(settings.restoreClipboardAfterInsert)")
+            }
             currentStatus = .idle
         } catch {
             debugLogStore.log("Pipeline error: \(error.localizedDescription)")
@@ -308,6 +323,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "com.apple.finder"
         ]
 
+        if let lastTargetApplicationBundleIdentifier,
+           !ignoredBundleIdentifiers.contains(lastTargetApplicationBundleIdentifier) {
+            return lastTargetApplicationBundleIdentifier
+        }
+
         if let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
            !ignoredBundleIdentifiers.contains(frontmost) {
             return frontmost
@@ -320,6 +340,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 !(app.bundleIdentifier.map { ignoredBundleIdentifiers.contains($0) } ?? false)
             }?
             .bundleIdentifier
+    }
+
+    private func installTargetApplicationTracker() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bundleIdentifier = application.bundleIdentifier,
+                  !self.isIgnoredTargetBundleIdentifier(bundleIdentifier) else {
+                return
+            }
+            self.lastTargetApplicationBundleIdentifier = bundleIdentifier
+            self.debugLogStore.log("Last target app updated: \(application.localizedName ?? bundleIdentifier)")
+        }
+    }
+
+    private func isIgnoredTargetBundleIdentifier(_ bundleIdentifier: String) -> Bool {
+        [
+            Bundle.main.bundleIdentifier ?? "",
+            "com.apple.controlcenter",
+            "com.apple.systemuiserver",
+            "com.apple.finder"
+        ].contains(bundleIdentifier)
     }
 
     private func startSilenceAutoStopMonitor() {
@@ -360,9 +406,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startLiveSpeechMonitor() {
-        liveSpeechMonitor.start(locale: Locale.current) { [weak self] event in
+        let locale = liveSpeechLocale()
+        liveSpeechMonitor.start(locale: locale) { [weak self] event in
             self?.debugLogStore.log(event)
+        } onPartialText: { [weak self] partialText in
+            self?.handleLivePartialText(partialText)
         }
+    }
+
+    private func liveSpeechLocale() -> Locale {
+        switch settingsStore.settings.targetLanguage {
+        case .english: return Locale(identifier: "en_US")
+        case .german: return Locale(identifier: "de_DE")
+        case .spanish: return Locale(identifier: "es_ES")
+        case .french: return Locale(identifier: "fr_FR")
+        case .russian, .auto: return Locale(identifier: "ru_RU")
+        }
+    }
+
+    private func handleLivePartialText(_ partialText: String) {
+        let normalizedPartial = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPartial.isEmpty else { return }
+
+        let delta = liveInsertionDelta(from: liveInsertedText, to: normalizedPartial)
+        guard !delta.isEmpty else { return }
+
+        liveInsertedText = normalizedPartial
+        liveInsertedAnyText = true
+        debugLogStore.log("Live insert: \(delta)")
+
+        let previousTask = liveInsertTask
+        liveInsertTask = Task {
+            await previousTask?.value
+            do {
+                try await insertionService.insertText(
+                    delta,
+                    restoreClipboard: false,
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                )
+            } catch {
+                debugLogStore.log("Live insert error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func liveInsertionDelta(from oldText: String, to newText: String) -> String {
+        guard !newText.isEmpty else { return "" }
+        guard !oldText.isEmpty else { return newText + " " }
+        guard newText.hasPrefix(oldText) else {
+            debugLogStore.log("Live correction ignored: \(newText)")
+            return ""
+        }
+
+        let suffix = String(newText.dropFirst(oldText.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !suffix.isEmpty else { return "" }
+        return suffix + " "
     }
 }
 
@@ -780,7 +878,7 @@ final class LiveSpeechMonitor {
     private let engine = AVAudioEngine()
     private var lastPartial = ""
 
-    func start(locale: Locale, log: @escaping (String) -> Void) {
+    func start(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
         stop()
         lastPartial = ""
         log("Live words monitor starting")
@@ -793,7 +891,7 @@ final class LiveSpeechMonitor {
             }
 
             DispatchQueue.main.async {
-                self.startRecognition(locale: locale, log: log)
+                self.startRecognition(locale: locale, log: log, onPartialText: onPartialText)
             }
         }
     }
@@ -810,7 +908,7 @@ final class LiveSpeechMonitor {
         recognizer = nil
     }
 
-    private func startRecognition(locale: Locale, log: @escaping (String) -> Void) {
+    private func startRecognition(locale: Locale, log: @escaping (String) -> Void, onPartialText: @escaping (String) -> Void) {
         recognizer = SFSpeechRecognizer(locale: locale) ?? SFSpeechRecognizer(locale: Locale(identifier: "ru_RU"))
         guard let recognizer, recognizer.isAvailable else {
             log("Live words unavailable: recognizer is not available for \(locale.identifier)")
@@ -819,6 +917,8 @@ final class LiveSpeechMonitor {
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+        request.addsPunctuation = false
         self.request = request
 
         let input = engine.inputNode
@@ -845,6 +945,7 @@ final class LiveSpeechMonitor {
                 guard !text.isEmpty, text != self.lastPartial else { return }
                 self.lastPartial = text
                 log("Live words: \(text)")
+                onPartialText(text)
             }
             if let error {
                 log("Live words error: \(error.localizedDescription)")
