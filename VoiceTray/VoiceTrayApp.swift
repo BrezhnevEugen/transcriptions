@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastTargetApplicationBundleIdentifier: String?
     private var liveInsertedText = ""
     private var liveStableText = ""
+    private var liveLatestPartialText = ""
     private var liveTailCandidate = ""
     private var liveTailConfirmationCount = 0
     private var liveInsertedOutputText = ""
@@ -146,6 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             targetApplicationBundleIdentifier = resolveTargetApplicationBundleIdentifier()
             liveInsertedText = ""
             liveStableText = ""
+            liveLatestPartialText = ""
             liveTailCandidate = ""
             liveTailConfirmationCount = 0
             liveInsertedOutputText = ""
@@ -176,6 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoStopTask = nil
         liveSpeechMonitor.stop()
         debugLogStore.log("Live words monitor stopped")
+        flushLatestLivePartialBeforeProcessing()
 
         do {
             currentStatus = .transcribing
@@ -250,9 +253,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                     debugLogStore.log("Post-processing completed: live draft replaced")
                 } catch VoiceTrayError.safeReplacementUnavailable {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(finalText, forType: .string)
-                    debugLogStore.log("Post-processing skipped: safe draft range not found. Final text copied to clipboard")
+                    debugLogStore.log("Post-processing: safe draft range not found. Appending processed text instead")
+                    try await insertionService.insertText(
+                        "\n" + finalText,
+                        restoreClipboard: settings.restoreClipboardAfterInsert,
+                        targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                    )
+                    debugLogStore.log("Post-processing completed: processed text appended")
                 }
             } else {
                 debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
@@ -456,6 +463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleLivePartialText(_ partialText: String) {
         let normalizedPartial = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedPartial.isEmpty else { return }
+        liveLatestPartialText = normalizedPartial
 
         let stableText = stableLiveText(from: normalizedPartial)
         guard !stableText.isEmpty else { return }
@@ -480,6 +488,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             } catch {
                 debugLogStore.log("Live insert error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func flushLatestLivePartialBeforeProcessing() {
+        let normalizedPartial = liveLatestPartialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPartial.isEmpty, normalizedPartial.count > liveInsertedText.count else { return }
+
+        let delta = liveInsertionDelta(from: liveInsertedText, to: normalizedPartial)
+        guard !delta.isEmpty else { return }
+
+        liveStableText = normalizedPartial
+        liveInsertedText = normalizedPartial
+        liveInsertedOutputText += delta
+        liveInsertedAnyText = true
+        debugLogStore.log("Live flush on stop: \(delta)")
+
+        let previousTask = liveInsertTask
+        liveInsertTask = Task {
+            await previousTask?.value
+            do {
+                try await insertionService.insertText(
+                    delta,
+                    restoreClipboard: false,
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                )
+            } catch {
+                debugLogStore.log("Live flush error: \(error.localizedDescription)")
             }
         }
     }
