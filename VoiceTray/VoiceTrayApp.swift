@@ -200,6 +200,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             debugLogStore.log("Transcribed text: \(transcription.text)")
 
             var finalText = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if settings.textProcessingMode != .raw {
+                currentStatus = .translating
+                debugLogStore.log("Text processing requested: \(settings.textProcessingMode.title), model: \(settings.textProcessingModel)")
+                let processor = OpenAITextProcessingService(apiKey: apiKey, settings: settings)
+                finalText = try await processor.process(
+                    text: finalText,
+                    sourceLanguage: transcription.detectedLanguage
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                debugLogStore.log("Processed text: \(finalText)")
+            }
+
             if settings.targetLanguage != .auto {
                 currentStatus = .translating
                 debugLogStore.log("Translation requested: \(settings.targetLanguage.displayName), model: \(settings.translationModel)")
@@ -751,7 +762,14 @@ struct SettingsView: View {
                 }
             }
 
+            Picker("Text processing", selection: $settingsStore.settings.textProcessingMode) {
+                ForEach(TextProcessingMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+
             TextField("OpenAI transcription model", text: $settingsStore.settings.transcriptionModel)
+            TextField("OpenAI text processing model", text: $settingsStore.settings.textProcessingModel)
             TextField("OpenAI translation model", text: $settingsStore.settings.translationModel)
             SecureField("OpenAI API key", text: $apiKey)
 
@@ -813,7 +831,9 @@ final class SettingsStore: ObservableObject {
 struct AppSettings: Codable, Equatable {
     var aiPlatform: AIPlatform = .directAPI
     var targetLanguage: TargetLanguage = .auto
+    var textProcessingMode: TextProcessingMode = .claudeStyle
     var transcriptionModel = "gpt-4o-mini-transcribe"
+    var textProcessingModel = "gpt-4.1-mini"
     var translationModel = "gpt-4.1-mini"
     var maxRecordingDurationSeconds = 60
     var restoreClipboardAfterInsert = true
@@ -834,6 +854,22 @@ enum AIPlatform: String, Codable, CaseIterable, Identifiable {
         case .cursor: return "Cursor"
         case .claude: return "Claude"
         case .codex: return "Codex"
+        }
+    }
+}
+
+enum TextProcessingMode: String, Codable, CaseIterable, Identifiable {
+    case raw
+    case claudeStyle
+    case cursorStyle
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .raw: return "Raw transcription"
+        case .claudeStyle: return "Claude-style cleanup"
+        case .cursorStyle: return "Cursor-style technical cleanup"
         }
     }
 }
@@ -1095,6 +1131,74 @@ final class OpenAITranscriptionService {
 struct OpenAITranscriptionResponse: Decodable {
     let text: String
     let language: String?
+}
+
+final class OpenAITextProcessingService {
+    private let apiKey: String
+    private let settings: AppSettings
+
+    init(apiKey: String, settings: AppSettings) {
+        self.apiKey = apiKey
+        self.settings = settings
+    }
+
+    func process(text: String, sourceLanguage: String?) async throws -> String {
+        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let prompt = prompt(for: settings.textProcessingMode, text: text, sourceLanguage: sourceLanguage)
+        let payload = OpenAIResponseRequest(model: settings.textProcessingModel, input: prompt)
+        request.httpBody = try JSONEncoder().encode(payload)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Provider error"
+            throw VoiceTrayError.providerError(message)
+        }
+
+        let decoded = try JSONDecoder().decode(OpenAIResponseResponse.self, from: data)
+        if let output = decoded.outputText, !output.isEmpty {
+            return output
+        }
+        return decoded.output?
+            .flatMap { $0.content ?? [] }
+            .compactMap { $0.text }
+            .joined(separator: "\n") ?? ""
+    }
+
+    private func prompt(for mode: TextProcessingMode, text: String, sourceLanguage: String?) -> String {
+        switch mode {
+        case .raw:
+            return text
+        case .claudeStyle:
+            return """
+            You are a careful dictation editor similar to high-quality assistant chat input cleanup.
+            Rewrite the dictated text into the user's intended message.
+            Remove speech disfluencies, duplicated words, false starts, and filler.
+            Preserve the user's meaning, tone, language, paragraph structure, technical terms, names, commands, URLs, filenames, code identifiers, and Markdown.
+            Do not answer the message. Do not add new facts. Output only the cleaned text.
+            Source language: \(sourceLanguage ?? "auto")
+
+            Dictation:
+            \(text)
+            """
+        case .cursorStyle:
+            return """
+            You are a technical dictation editor for coding chats and IDE prompts.
+            Convert the dictated text into a concise, actionable developer prompt.
+            Fix repeated words, broken syllables, punctuation, casing, and obvious speech-recognition artifacts.
+            Preserve all code identifiers, file paths, commands, URLs, issue names, model names, keyboard shortcuts, and exact technical intent.
+            If the text is casual chat, keep it casual; if it is a coding instruction, make it crisp like a Cursor/agent prompt.
+            Do not solve the task. Do not add requirements. Output only the cleaned text.
+            Source language: \(sourceLanguage ?? "auto")
+
+            Dictation:
+            \(text)
+            """
+        }
+    }
 }
 
 final class OpenAITranslationService {
