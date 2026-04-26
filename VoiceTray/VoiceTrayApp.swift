@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var targetApplicationBundleIdentifier: String?
     private var lastTargetApplicationBundleIdentifier: String?
     private var liveInsertedText = ""
+    private var liveStableText = ""
     private var liveInsertedOutputText = ""
     private var liveInsertedAnyText = false
     private var liveInsertTask: Task<Void, Never>?
@@ -142,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             targetApplicationBundleIdentifier = resolveTargetApplicationBundleIdentifier()
             liveInsertedText = ""
+            liveStableText = ""
             liveInsertedOutputText = ""
             liveInsertedAnyText = false
             liveInsertTask = nil
@@ -440,10 +442,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let normalizedPartial = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedPartial.isEmpty else { return }
 
-        let delta = liveInsertionDelta(from: liveInsertedText, to: normalizedPartial)
+        let stableText = stableLiveText(from: normalizedPartial)
+        guard !stableText.isEmpty else { return }
+
+        let delta = liveInsertionDelta(from: liveInsertedText, to: stableText)
         guard !delta.isEmpty else { return }
 
-        liveInsertedText = normalizedPartial
+        liveStableText = stableText
+        liveInsertedText = stableText
         liveInsertedOutputText += delta
         liveInsertedAnyText = true
         debugLogStore.log("Live insert: \(delta)")
@@ -461,6 +467,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 debugLogStore.log("Live insert error: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func stableLiveText(from text: String) -> String {
+        let words = text
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .map(String.init)
+        guard words.count >= 2 else { return "" }
+
+        let stableWords = words.dropLast()
+        let stableText = stableWords.joined(separator: " ")
+        guard stableText.count >= liveStableText.count else { return liveStableText }
+        return stableText
     }
 
     private func liveInsertionDelta(from oldText: String, to newText: String) -> String {
