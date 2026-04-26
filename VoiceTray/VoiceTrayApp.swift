@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var targetApplicationBundleIdentifier: String?
     private var lastTargetApplicationBundleIdentifier: String?
     private var liveInsertedText = ""
+    private var liveInsertedOutputText = ""
     private var liveInsertedAnyText = false
     private var liveInsertTask: Task<Void, Never>?
     private var currentStatus: AppStatus = .idle {
@@ -141,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             targetApplicationBundleIdentifier = resolveTargetApplicationBundleIdentifier()
             liveInsertedText = ""
+            liveInsertedOutputText = ""
             liveInsertedAnyText = false
             liveInsertTask = nil
             debugLogStore.log("Target app: \(targetApplicationBundleIdentifier ?? "unknown")")
@@ -221,10 +223,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             currentStatus = .inserting
             if liveInsertedAnyText {
+                debugLogStore.log("Post-processing: replacing live draft with final text")
                 await liveInsertTask?.value
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(finalText, forType: .string)
-                debugLogStore.log("Final text copied to clipboard; live insert already wrote text into target app")
+                try await insertionService.replaceLastInsertedText(
+                    finalText,
+                    replacingCharacterCount: liveInsertedOutputText.count,
+                    targetApplicationBundleIdentifier: targetApplicationBundleIdentifier
+                )
+                debugLogStore.log("Post-processing completed: live draft replaced")
             } else {
                 debugLogStore.log("Insertion started. Accessibility trusted: \(AXIsProcessTrusted())")
                 try await insertionService.insertText(
@@ -432,6 +438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !delta.isEmpty else { return }
 
         liveInsertedText = normalizedPartial
+        liveInsertedOutputText += delta
         liveInsertedAnyText = true
         debugLogStore.log("Live insert: \(delta)")
 
@@ -1110,6 +1117,39 @@ final class TextInsertionService {
             if let oldString {
                 pasteboard.setString(oldString, forType: .string)
             }
+        }
+    }
+
+    func replaceLastInsertedText(_ text: String, replacingCharacterCount characterCount: Int, targetApplicationBundleIdentifier: String?) async throws {
+        guard AXIsProcessTrusted() else {
+            throw VoiceTrayError.accessibilityDeniedCopied
+        }
+
+        try await activateTargetApplication(bundleIdentifier: targetApplicationBundleIdentifier)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        deletePreviousCharacters(characterCount)
+        try await Task.sleep(nanoseconds: 120_000_000)
+        try await insertText(text, restoreClipboard: false, targetApplicationBundleIdentifier: targetApplicationBundleIdentifier)
+    }
+
+    private func activateTargetApplication(bundleIdentifier: String?) async throws {
+        guard let bundleIdentifier,
+              let targetApplication = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first else {
+            return
+        }
+        targetApplication.activate(options: [.activateIgnoringOtherApps])
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+
+    private func deletePreviousCharacters(_ count: Int) {
+        guard count > 0 else { return }
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let cappedCount = min(count, 4_000)
+        for _ in 0..<cappedCount {
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x33, keyDown: true)
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x33, keyDown: false)
+            keyDown?.post(tap: .cghidEventTap)
+            keyUp?.post(tap: .cghidEventTap)
         }
     }
 }
